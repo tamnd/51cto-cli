@@ -1,0 +1,10 @@
+title       = "cto"
+baseURL     = "https://51cto-cli.tamnd.com/"
+description = "Browse 51CTO, China's IT community"
+contentDir  = "content"
+outputDir   = "public"
+theme       = "tago-doks"
+syntaxHighlight = "true"
+
+[params]
+github = "https://github.com/tamnd/51cto-cli"
