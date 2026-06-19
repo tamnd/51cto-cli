@@ -1,10 +1,10 @@
-// Package cli assembles the cto command tree from the 51cto
-// domain on top of the any-cli/kit framework.
+// Package cli assembles the cto command tree from the fiftyone domain
+// on top of the any-cli/kit framework.
 package cli
 
 import (
 	"github.com/tamnd/any-cli/kit"
-	"github.com/tamnd/51cto-cli/51cto"
+	fiftyone "github.com/tamnd/51cto-cli/51cto"
 )
 
 // Build metadata, set via -ldflags at release time.
@@ -14,21 +14,19 @@ var (
 	Date    = "unknown"
 )
 
-// NewApp assembles the kit application from the 51cto domain. The
+// NewApp assembles the kit application from the fiftyone domain. The
 // domain's Register installs the client factory and every operation, so the
-// binary and a host (ant, which blank-imports the package) share one source of
-// truth. kit.Run turns the App into the CLI, plus the serve and mcp surfaces and
-// the typed-error-to-exit-code mapping.
+// binary and a host share one source of truth. kit.Run turns the App into the
+// CLI plus the serve and mcp surfaces and the typed-error-to-exit-code mapping.
 //
 // To add a command, declare it in 51cto/domain.go with kit.Handle and it
-// appears here automatically. Reach for app.AddCommand only for a verb that does
-// not fit the emit-records shape, the way version does below.
+// appears here automatically.
 func NewApp() *kit.App {
-	id := 51cto.Domain{}.Info().Identity
+	id := fiftyone.Domain{}.Info().Identity
 	id.Version = Version
 
 	app := kit.New(id)
-	(51cto.Domain{}).Register(app)
+	fiftyone.Domain{}.Register(app)
 	app.AddCommand(newVersionCmd())
 	return app
 }

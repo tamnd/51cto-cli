@@ -1,77 +1,97 @@
-package 51cto
+package fiftyone
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"net/url"
+	"regexp"
 	"strings"
 
 	"github.com/tamnd/any-cli/kit"
 	"github.com/tamnd/any-cli/kit/errs"
 )
 
-// domain.go exposes 51cto as a kit Domain: a driver that a multi-domain
-// host (ant) enables with a single blank import,
+// domain.go registers the fiftyone kit Domain so a blank import in a
+// multi-domain host enables the driver:
 //
 //	import _ "github.com/tamnd/51cto-cli/51cto"
 //
-// exactly as a database/sql program enables a driver with `import _
-// "github.com/lib/pq"`. The init below registers it; the host then dereferences
-// 51cto:// URIs by routing to the operations Register installs. The same
-// Domain also builds the standalone cto binary (see cli.NewApp), so the
-// binary and a host share one source of truth.
-//
-// This is the scaffold's starting point: one resource type, "page", served by a
-// resolver op and a list op. Add your real types here as you model the site.
+// The same Domain also builds the standalone cto binary (see cli.NewApp).
 func init() { kit.Register(Domain{}) }
 
-// Domain is the 51cto driver. It carries no state; the per-run client is
+// Domain is the 51CTO driver. It carries no state; the per-run client is
 // built by the factory Register hands kit.
 type Domain struct{}
 
-// Info describes the scheme, the hostnames a pasted link is matched against, and
-// the identity reused for the binary's help and version.
+// Info describes the scheme, the hostnames, and the binary identity.
 func (Domain) Info() kit.DomainInfo {
 	return kit.DomainInfo{
-		Scheme: "51cto",
-		Hosts:  []string{Host},
+		Scheme:  "cto",
+		Aliases: []string{"fiftyone"},
+		Hosts:   []string{Host, BlogHost, SearchHost},
 		Identity: kit.Identity{
 			Binary: "cto",
 			Short:  "Browse 51CTO, China's IT community",
-			Long: `Browse 51CTO, China's IT community
+			Long: `cto reads public 51CTO data over plain HTTPS and prints clean structured records.
 
-cto reads public 51cto data over plain HTTPS, shapes it into
-clean records, and prints output that pipes into the rest of your tools. No API
-key, nothing to run alongside it.`,
+51CTO (51cto.com) is China's largest IT professional platform: technical articles,
+blog posts, Q&A, courses, and videos for millions of Chinese developers.
+
+Note: 51CTO is protected by Tencent Cloud EdgeOne bot-protection. Commands may
+return exit code 5 (blocked) when run from datacenter IPs. Residential IPs and
+browser sessions typically have better access.
+
+Quick start:
+  cto hot                     trending articles
+  cto hot --category golang   trending Go articles
+  cto search kubernetes       search for articles
+  cto article 786963          fetch a single article
+  cto blog superwen           list a user's blog posts`,
 			Site: Host,
 			Repo: "https://github.com/tamnd/51cto-cli",
 		},
 	}
 }
 
-// Register installs the client factory and every operation onto app. A resolver
-// op (Single) names its own record type and answers `ant get`; a List op
-// enumerates a parent resource's members and answers `ant ls`.
+// Register installs the client factory and operations onto app.
 func (Domain) Register(app *kit.App) {
 	app.SetClient(newClient)
 
-	// Resolver op: one record per id, the home of `cto page` and
-	// `ant get 51cto://page/<id>`.
-	kit.Handle(app, kit.OpMeta{Name: "page", Group: "read", Single: true,
-		Summary: "Fetch a page by path or URL", URIType: "page", Resolver: true,
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, getPage)
+	kit.Handle(app, kit.OpMeta{
+		Name:    "hot",
+		Group:   "browse",
+		Summary: "List trending articles",
+	}, hotHandler)
 
-	// List op: members of a page, the home of `cto links` and `ant ls`.
-	// It emits page stubs, so every listed member is itself an addressable
-	// 51cto://page/ URI a host can follow.
-	kit.Handle(app, kit.OpMeta{Name: "links", Group: "read", List: true,
-		Summary: "List the pages a page links to", URIType: "page",
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, listLinks)
+	kit.Handle(app, kit.OpMeta{
+		Name:    "search",
+		Group:   "browse",
+		Summary: "Search 51CTO for articles and blog posts",
+		Args:    []kit.Arg{{Name: "query", Help: "search keywords"}},
+	}, searchHandler)
+
+	kit.Handle(app, kit.OpMeta{
+		Name:     "article",
+		Group:    "read",
+		Single:   true,
+		Resolver: true,
+		URIType:  "article",
+		Summary:  "Fetch a single article by ID or URL",
+		Args:     []kit.Arg{{Name: "ref", Help: "article ID or URL"}},
+	}, articleHandler)
+
+	kit.Handle(app, kit.OpMeta{
+		Name:    "blog",
+		Group:   "read",
+		Summary: "List blog posts for a 51CTO user",
+		Args:    []kit.Arg{{Name: "username", Help: "51CTO blog username"}},
+	}, blogHandler)
 }
 
-// newClient builds the client from the host-resolved config, so a host and the
-// standalone binary pace and identify themselves the same way.
+// newClient builds a Client from the resolved kit Config.
 func newClient(_ context.Context, cfg kit.Config) (any, error) {
-	c := NewClient()
+	c := DefaultConfig()
 	if cfg.UserAgent != "" {
 		c.UserAgent = cfg.UserAgent
 	}
@@ -82,45 +102,92 @@ func newClient(_ context.Context, cfg kit.Config) (any, error) {
 		c.Retries = cfg.Retries
 	}
 	if cfg.Timeout > 0 {
-		c.HTTP.Timeout = cfg.Timeout
+		c.Timeout = cfg.Timeout
 	}
-	return c, nil
+	return NewClient(c), nil
 }
 
-// --- inputs ---
-//
-// Each handler takes a typed input struct. kit fills the fields from the tags:
-// kit:"arg" is a positional argument, kit:"flag,inherit" binds the framework's
-// shared flag of the same name, and kit:"inject" receives the client newClient
-// builds.
+// --- input structs ---
 
-type pageRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
+type hotInput struct {
+	Category string  `kit:"flag" help:"technology category (golang, python, cloud, ...)"`
+	Limit    int     `kit:"flag,inherit" help:"max articles" default:"20"`
+	Client   *Client `kit:"inject"`
+}
+
+type searchInput struct {
+	Query   string  `kit:"arg" help:"search keywords"`
+	Type    string  `kit:"flag" help:"content type: article, blog, qa" default:"article"`
+	Limit   int     `kit:"flag,inherit" help:"max results" default:"20"`
+	Client  *Client `kit:"inject"`
+}
+
+type articleInput struct {
+	Ref    string  `kit:"arg" help:"article ID or URL"`
 	Client *Client `kit:"inject"`
 }
 
-type listRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
-	Limit  int     `kit:"flag,inherit" help:"max results"`
-	Client *Client `kit:"inject"`
+type blogInput struct {
+	Username string  `kit:"arg" help:"51CTO blog username"`
+	Limit    int     `kit:"flag,inherit" help:"max posts" default:"20"`
+	Client   *Client `kit:"inject"`
 }
 
 // --- handlers ---
 
-func getPage(ctx context.Context, in pageRef, emit func(*Page) error) error {
-	p, err := in.Client.GetPage(ctx, pagePath(in.Ref))
+func hotHandler(ctx context.Context, in hotInput, emit func(Article) error) error {
+	arts, err := in.Client.Hot(ctx, in.Category, in.Limit)
 	if err != nil {
 		return mapErr(err)
 	}
-	return emit(p)
+	if len(arts) == 0 {
+		return errs.NotFound("no articles found")
+	}
+	for _, a := range arts {
+		if err := emit(a); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
-func listLinks(ctx context.Context, in listRef, emit func(*Page) error) error {
-	pages, err := in.Client.PageLinks(ctx, pagePath(in.Ref), in.Limit)
+func searchHandler(ctx context.Context, in searchInput, emit func(SearchResult) error) error {
+	results, err := in.Client.Search(ctx, in.Query, in.Type, in.Limit)
 	if err != nil {
 		return mapErr(err)
 	}
-	for _, p := range pages {
+	if len(results) == 0 {
+		return errs.NotFound("no results found for %q", in.Query)
+	}
+	for _, r := range results {
+		if err := emit(r); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func articleHandler(ctx context.Context, in articleInput, emit func(*Article) error) error {
+	id := resolveArticleRef(in.Ref)
+	if id == "" {
+		return errs.Usage("invalid article reference: %q (want numeric ID or 51cto.com URL)", in.Ref)
+	}
+	art, err := in.Client.Article(ctx, id)
+	if err != nil {
+		return mapErr(err)
+	}
+	return emit(art)
+}
+
+func blogHandler(ctx context.Context, in blogInput, emit func(BlogPost) error) error {
+	posts, err := in.Client.Blog(ctx, in.Username, in.Limit)
+	if err != nil {
+		return mapErr(err)
+	}
+	if len(posts) == 0 {
+		return errs.NotFound("no blog posts found for user %q", in.Username)
+	}
+	for _, p := range posts {
 		if err := emit(p); err != nil {
 			return err
 		}
@@ -128,46 +195,70 @@ func listLinks(ctx context.Context, in listRef, emit func(*Page) error) error {
 	return nil
 }
 
-// --- Resolver: the URI-native string functions, pure and network-free ---
+// --- Resolver ---
 
-// Classify turns any accepted input — a bare path or a full 51cto.com URL —
-// into the canonical (type, id), so `ant resolve` and `ant url` touch no network.
+var articleIDRE = regexp.MustCompile(`^\d+$`)
+
+// Classify turns any accepted input into the canonical (uriType, id).
 func (Domain) Classify(input string) (uriType, id string, err error) {
-	id = pagePath(input)
-	if id == "" {
-		return "", "", errs.Usage("unrecognized 51cto reference: %q", input)
+	input = strings.TrimSpace(input)
+	if input == "" {
+		return "", "", errs.Usage("cto: empty reference")
 	}
-	return "page", id, nil
+	// Numeric → article.
+	if articleIDRE.MatchString(input) {
+		return "article", input, nil
+	}
+	// Full URL → classify by path.
+	if u, e := url.Parse(input); e == nil && (u.Scheme == "http" || u.Scheme == "https") {
+		if id := articleIDFromURL(u.Path); id != "" {
+			return "article", id, nil
+		}
+		if m := blogLinkRE.FindStringSubmatch(u.Path); len(m) >= 3 {
+			return "blog", fmt.Sprintf("%s/%s", m[1], m[2]), nil
+		}
+		return "", "", errs.Usage("cto: unrecognized URL path: %q", u.Path)
+	}
+	return "", "", errs.Usage("cto: unrecognized reference: %q", input)
 }
 
-// Locate is the inverse: the live https URL for a (type, id).
+// Locate returns the canonical URL for a (uriType, id).
 func (Domain) Locate(uriType, id string) (string, error) {
-	if uriType != "page" {
-		return "", errs.Usage("51cto has no resource type %q", uriType)
+	switch uriType {
+	case "article":
+		return fmt.Sprintf("https://%s/article/%s.html", Host, id), nil
+	case "blog":
+		return fmt.Sprintf("https://%s/%s", BlogHost, id), nil
+	default:
+		return "", errs.Usage("cto has no resource type %q", uriType)
 	}
-	return BaseURL + "/" + strings.Trim(id, "/"), nil
 }
 
 // --- helpers ---
 
-// pagePath turns any accepted input into the canonical page id: the path of a
-// full URL on this host, or a bare path with its slashes trimmed.
-func pagePath(input string) string {
-	input = strings.TrimSpace(input)
-	if u, err := url.Parse(input); err == nil && (u.Scheme == "http" || u.Scheme == "https") {
-		return strings.Trim(u.Path, "/")
+// resolveArticleRef converts a user-supplied reference to a numeric article ID.
+// Accepts: bare numeric ID, full 51cto.com article URL.
+func resolveArticleRef(ref string) string {
+	ref = strings.TrimSpace(ref)
+	if articleIDRE.MatchString(ref) {
+		return ref
 	}
-	return strings.Trim(input, "/")
+	if u, e := url.Parse(ref); e == nil && (u.Scheme == "http" || u.Scheme == "https") {
+		return articleIDFromURL(u.Path)
+	}
+	return ""
 }
 
-// mapErr converts a library error into the kit error kind that carries the right
-// exit code, so a host renders the same outcomes the standalone binary does. As
-// you add sentinel errors to the library, map them here, for example:
-//
-//	case errors.Is(err, ErrNotFound):
-//		return errs.NotFound("%s", err.Error())
-//	case errors.Is(err, ErrRateLimited):
-//		return errs.RateLimited("%s", err.Error())
+// mapErr converts library errors to kit error kinds with the right exit codes.
 func mapErr(err error) error {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, ErrBlocked) {
+		return errs.RateLimited("51CTO requires browser verification (HTTP 567 / EdgeOne JS challenge); try from a residential IP or pass --cookie")
+	}
+	if errors.Is(err, ErrNotFound) {
+		return errs.NotFound("%s", err.Error())
+	}
 	return err
 }
